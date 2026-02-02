@@ -8,7 +8,7 @@ on:
 
 jobs:
   install-smoke:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Checkout CLI
         uses: actions/checkout@v4
