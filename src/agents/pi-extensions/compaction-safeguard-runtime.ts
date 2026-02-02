@@ -1,5 +1,7 @@
 export type CompactionSafeguardRuntimeValue = {
   maxHistoryShare?: number;
+  /** Minimum messages to preserve regardless of token-based decisions. */
+  minPreservedMessages?: number;
 };
 
 // Session-scoped runtime registry keyed by object identity.

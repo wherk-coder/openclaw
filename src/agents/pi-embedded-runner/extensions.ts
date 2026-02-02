@@ -85,6 +85,7 @@ export function buildEmbeddedExtensionPaths(params: {
     const compactionCfg = params.cfg?.agents?.defaults?.compaction;
     setCompactionSafeguardRuntime(params.sessionManager, {
       maxHistoryShare: compactionCfg?.maxHistoryShare,
+      minPreservedMessages: compactionCfg?.minPreservedMessages ?? 25,
     });
     paths.push(resolvePiExtensionPath("compaction-safeguard"));
   }

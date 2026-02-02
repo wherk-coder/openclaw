@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, FileOperations } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, FileOperations, SessionEntry } from "@mariozechner/pi-coding-agent";
 import {
   BASE_CHUNK_RATIO,
   MIN_CHUNK_RATIO,
@@ -158,9 +158,112 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
   return `\n\n${sections.join("\n\n")}`;
 }
 
+function isMessageEntry(entry: SessionEntry): boolean {
+  return entry.type === "message" || entry.type === "custom_message";
+}
+
+/**
+ * Count message entries starting from a given index in branchEntries.
+ */
+function countMessagesFromIndex(branchEntries: SessionEntry[], startIndex: number): number {
+  let count = 0;
+  for (let i = startIndex; i < branchEntries.length; i++) {
+    const entry = branchEntries[i];
+    if (entry && isMessageEntry(entry)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * Find the index of the last compaction entry in branchEntries, or -1 if none.
+ */
+function findLastCompactionIndex(branchEntries: SessionEntry[]): number {
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i];
+    if (entry && entry.type === "compaction") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+type AdjustedCutPoint = {
+  adjusted: boolean;
+  newFirstKeptEntryId: string;
+  newFirstKeptIndex: number;
+  messagesToAdd: AgentMessage[];
+};
+
+/**
+ * Adjusts the cut point to preserve at least minMessages after compaction.
+ * Returns null if no adjustment needed or not possible.
+ */
+function adjustCutPointForMinMessages(
+  branchEntries: SessionEntry[],
+  currentFirstKeptEntryId: string,
+  minMessages: number,
+): AdjustedCutPoint | null {
+  // Find the current cut point index
+  const currentIndex = branchEntries.findIndex((e) => e.id === currentFirstKeptEntryId);
+  if (currentIndex === -1) {
+    return null;
+  }
+
+  // Count messages from the cut point onwards (inclusive)
+  // firstKeptEntryId and all entries after it are preserved
+  const currentMessageCount = countMessagesFromIndex(branchEntries, currentIndex);
+  if (currentMessageCount >= minMessages) {
+    return null; // No adjustment needed
+  }
+
+  // Find the previous compaction boundary (we can't cut before it)
+  const lastCompactionIndex = findLastCompactionIndex(branchEntries);
+  const minCutIndex = lastCompactionIndex === -1 ? 0 : lastCompactionIndex + 1;
+
+  // Walk backwards from the current cut point to find where we need to start
+  // to preserve minMessages
+  let messagesNeeded = minMessages - currentMessageCount;
+  let newCutIndex = currentIndex;
+  const messagesToAdd: AgentMessage[] = [];
+
+  for (let i = currentIndex - 1; i >= minCutIndex && messagesNeeded > 0; i--) {
+    const entry = branchEntries[i];
+    if (!entry) {
+      continue;
+    }
+    newCutIndex = i;
+    if (isMessageEntry(entry)) {
+      messagesNeeded--;
+      // Extract the message from the entry
+      if (entry.type === "message") {
+        messagesToAdd.unshift(entry.message);
+      }
+    }
+  }
+
+  // If we couldn't get enough messages (hit the boundary), still use the adjusted cut point
+  if (newCutIndex === currentIndex) {
+    return null; // No change possible
+  }
+
+  const newEntry = branchEntries[newCutIndex];
+  if (!newEntry) {
+    return null;
+  }
+
+  return {
+    adjusted: true,
+    newFirstKeptEntryId: newEntry.id,
+    newFirstKeptIndex: newCutIndex,
+    messagesToAdd,
+  };
+}
+
 export default function compactionSafeguardExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", async (event, ctx) => {
-    const { preparation, customInstructions, signal } = event;
+    const { preparation, branchEntries, customInstructions, signal } = event;
     const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
     const fileOpsSummary = formatFileOperations(readFiles, modifiedFiles);
     const toolFailures = collectToolFailures([
@@ -194,6 +297,9 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       };
     }
 
+    // Start with the preparation's cut point; may be adjusted for minPreservedMessages
+    let firstKeptEntryId = preparation.firstKeptEntryId;
+
     try {
       const contextWindowTokens = resolveContextWindowTokens(model);
       const turnPrefixMessages = preparation.turnPrefixMessages ?? [];
@@ -201,6 +307,23 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
 
       const runtime = getCompactionSafeguardRuntime(ctx.sessionManager);
       const maxHistoryShare = runtime?.maxHistoryShare ?? 0.5;
+      const minPreservedMessages = runtime?.minPreservedMessages ?? 25;
+
+      // Adjust cut point if needed to preserve minimum messages
+      const cutPointAdjustment = adjustCutPointForMinMessages(
+        branchEntries,
+        preparation.firstKeptEntryId,
+        minPreservedMessages,
+      );
+      if (cutPointAdjustment?.adjusted) {
+        firstKeptEntryId = cutPointAdjustment.newFirstKeptEntryId;
+        // Prepend the additional messages that will now be summarized
+        messagesToSummarize = [...cutPointAdjustment.messagesToAdd, ...messagesToSummarize];
+        console.warn(
+          `Compaction safeguard: adjusted cut point to preserve ${minPreservedMessages} messages ` +
+            `(added ${cutPointAdjustment.messagesToAdd.length} messages to summarize).`,
+        );
+      }
 
       const tokensBefore =
         typeof preparation.tokensBefore === "number" && Number.isFinite(preparation.tokensBefore)
@@ -311,7 +434,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       return {
         compaction: {
           summary,
-          firstKeptEntryId: preparation.firstKeptEntryId,
+          firstKeptEntryId,
           tokensBefore: preparation.tokensBefore,
           details: { readFiles, modifiedFiles },
         },
@@ -325,7 +448,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       return {
         compaction: {
           summary: fallbackSummary,
-          firstKeptEntryId: preparation.firstKeptEntryId,
+          firstKeptEntryId,
           tokensBefore: preparation.tokensBefore,
           details: { readFiles, modifiedFiles },
         },
@@ -339,6 +462,10 @@ export const __testing = {
   formatToolFailuresSection,
   computeAdaptiveChunkRatio,
   isOversizedForSummary,
+  isMessageEntry,
+  countMessagesFromIndex,
+  findLastCompactionIndex,
+  adjustCutPointForMinMessages,
   BASE_CHUNK_RATIO,
   MIN_CHUNK_RATIO,
   SAFETY_MARGIN,
